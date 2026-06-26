@@ -50,20 +50,50 @@ def split_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> lis
     return splitter.split_text(text)
 
 
-def build_vectorstore(chunks: list, embeddings):
+def build_vectorstore(chunks: list, embeddings, batch_size: int = 50):
     """
-    Tạo FAISS vectorstore từ danh sách chunks và embeddings.
+    Tao FAISS vectorstore tu danh sach chunks va embeddings.
+    Embeds in batches to respect rate limits (e.g. Gemini free tier: 100 req/min).
 
     Args:
-        chunks    : list[str] — danh sách text chunks đã chia
-        embeddings: Embeddings instance (từ get_embeddings())
+        chunks     : list[str] -- danh sach text chunks da chia
+        embeddings : Embeddings instance (tu get_embeddings())
+        batch_size : so chunks moi batch (default 50 de tranh rate limit)
 
     Returns:
-        FAISS vectorstore đã được index và sẵn sàng dùng để retrieve
+        FAISS vectorstore da duoc index va san sang dung de retrieve
     """
+    import time
     from langchain_community.vectorstores import FAISS
 
-    print(f"🔨 Đang tạo FAISS index từ {len(chunks)} chunks ...")
-    vectorstore = FAISS.from_texts(chunks, embeddings)
-    print("✅ FAISS vectorstore đã sẵn sàng.")
+    print(f"Building FAISS index from {len(chunks)} chunks (batch_size={batch_size}) ...")
+
+    vectorstore = None
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        print(f"  Embedding batch {i // batch_size + 1}/{(len(chunks) + batch_size - 1) // batch_size} ({len(batch)} chunks)...")
+
+        # Retry with exponential backoff for rate limit errors
+        for attempt in range(5):
+            try:
+                if vectorstore is None:
+                    vectorstore = FAISS.from_texts(batch, embeddings)
+                else:
+                    batch_vs = FAISS.from_texts(batch, embeddings)
+                    vectorstore.merge_from(batch_vs)
+                break
+            except Exception as e:
+                if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                    wait = 2 ** attempt * 15  # 15s, 30s, 60s, 120s, 240s
+                    print(f"  Rate limit hit, waiting {wait}s before retry (attempt {attempt+1}/5)...")
+                    time.sleep(wait)
+                else:
+                    raise
+
+        # Sleep between batches to stay within rate limits
+        if i + batch_size < len(chunks):
+            time.sleep(2)
+
+    print("FAISS vectorstore ready.")
     return vectorstore
+
